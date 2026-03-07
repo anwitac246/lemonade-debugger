@@ -1,16 +1,18 @@
 import React, { useRef, useState } from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text, useInput, useApp } from 'ink';
 import { Banner } from './components/banner-text.js';
 import CommandsHelp from './components/command-help.js';
 import Prompt from './components/prompt.js';
 import { CommandHistory } from './engine/history.js';
 import { createShell } from "./engine/shell.js";
-// import {TerminalBuffer} from "./engine/terminal-buffer.js";
 
 export default function App() {
 
+	const { exit } = useApp();
+
 	const historyRef = useRef(new CommandHistory(200));
 	const [entries, setEntries] = useState([]);
+	const [ctrlCount, setCtrlCount] = useState(0);
 
 	const shellRef = useRef(null);
 
@@ -39,7 +41,7 @@ export default function App() {
 			{ command, output: "" }
 		]);
 
-		if (command.startsWith("lemonade debug")) {
+		if (command.startsWith("debug")) {
 
 			setEntries(prev => [
 				...prev,
@@ -51,6 +53,26 @@ export default function App() {
 
 		shellRef.current.write(command + "\r");
 	}
+
+	useInput((input, key) => {
+
+		if (key.ctrl && input === "c") {
+
+			if (ctrlCount === 1) {
+				shellRef.current?.kill();
+				exit();
+				return;
+			}
+
+			setCtrlCount(1);
+
+			setTimeout(() => {
+				setCtrlCount(0);
+			}, 2000);
+
+			return;
+		}
+	});
 
 	return (
 		<Box flexDirection="column">
@@ -64,7 +86,7 @@ export default function App() {
 						{entry.command && (
 							<Text color="green">{`> ${entry.command}`}</Text>
 						)}
-						<Text>{entry.output}</Text>
+						<Text color="gray">{entry.output}</Text>
 					</Box>
 				))}
 			</Box>
@@ -73,6 +95,13 @@ export default function App() {
 				history={historyRef.current}
 				onCommand={runCommand}
 			/>
+
+			{ctrlCount === 1 && (
+				<Text>
+					Press Ctrl+C again to terminate{" "}
+					<Text color="yellow">LEMONADE</Text>
+				</Text>
+			)}
 
 		</Box>
 	);
