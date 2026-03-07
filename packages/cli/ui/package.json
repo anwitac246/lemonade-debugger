@@ -9,7 +9,7 @@
 	},
 	"scripts": {
 		"build": "babel --out-dir=dist source",
-		"dev": "node source/cli.js",
+		"dev": "npm run build && node dist/cli.js",
 		"test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
 	},
 	"files": [
