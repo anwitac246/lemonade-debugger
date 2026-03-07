@@ -1,10 +1,11 @@
-import React, {useRef, useState} from 'react';
-import {Box, Text} from 'ink';
-import {Banner} from './components/banner-text.js';
+import React, { useRef, useState } from 'react';
+import { Box, Text } from 'ink';
+import { Banner } from './components/banner-text.js';
 import CommandsHelp from './components/command-help.js';
 import Prompt from './components/prompt.js';
-import {CommandHistory} from './engine/history.js';
-import {createShell} from "./engine/shell.js";
+import { CommandHistory } from './engine/history.js';
+import { createShell } from "./engine/shell.js";
+// import {TerminalBuffer} from "./engine/terminal-buffer.js";
 
 export default function App() {
 
@@ -15,20 +16,36 @@ export default function App() {
 
 	if (!shellRef.current) {
 		shellRef.current = createShell(data => {
+
+			const lines = data
+				.replace(/\r/g, "")
+				.split("\n")
+				.filter(Boolean);
+
 			setEntries(prev => [
 				...prev,
-				{command: "", output: data}
+				...lines.map(line => ({
+					command: "",
+					output: line
+				}))
 			]);
 		});
 	}
 
 	function runCommand(command) {
 
-		if (command.startsWith("debug")) {
+		setEntries(prev => [
+			...prev,
+			{ command, output: "" }
+		]);
+
+		if (command.startsWith("lemonade debug")) {
+
 			setEntries(prev => [
 				...prev,
-				{command, output: "Running debugger..."}
+				{ command: "", output: "Running debugger..." }
 			]);
+
 			return;
 		}
 

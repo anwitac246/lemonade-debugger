@@ -5,6 +5,8 @@ export default function Prompt({history, onCommand}) {
 	const [input, setInput] = useState("");
 
 	useInput((char, key) => {
+
+		// ENTER
 		if (key.return) {
 			const command = input.trim();
 
@@ -14,21 +16,40 @@ export default function Prompt({history, onCommand}) {
 			}
 
 			setInput("");
+			return;
 		}
 
-		else if (key.upArrow) {
-			setInput(history.up());
+		// HISTORY UP
+		if (key.upArrow) {
+			const previous = history.up();
+			if (previous !== undefined) {
+				setInput(previous);
+			}
+			return;
 		}
 
-		else if (key.downArrow) {
-			setInput(history.down());
+		// HISTORY DOWN
+		if (key.downArrow) {
+			const next = history.down();
+			if (next !== undefined) {
+				setInput(next);
+			}
+			return;
 		}
 
-		else if (key.backspace || key.delete) {
+		// BACKSPACE
+		if (key.backspace || key.delete) {
 			setInput(prev => prev.slice(0, -1));
+			return;
 		}
 
-		else {
+		// IGNORE CONTROL KEYS
+		if (key.ctrl || key.meta) {
+			return;
+		}
+
+		// ADD CHARACTER (only if printable)
+		if (char && char.length === 1) {
 			setInput(prev => prev + char);
 		}
 	});
@@ -36,7 +57,8 @@ export default function Prompt({history, onCommand}) {
 	return (
 		<Box>
 			<Text color="green">{"> "}</Text>
-			<Text>{input}_</Text>
+			<Text color="cyan">{input}</Text>
+			<Text color="gray">_</Text>
 		</Box>
 	);
 }
