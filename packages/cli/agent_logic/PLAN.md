@@ -600,7 +600,7 @@ Step by step:
 4. **Planner** routes to Debug Agent. Permission prompt appears: "Lemonade wants to attach a debugger. Allow? (y/n)"
 5. **Debug Agent** attaches via DAP, sets breakpoint at the crash site, runs the service.
 6. Breakpoint hits. Stack trace shows: `createAppointment → authMiddleware → (skipped)`. Variable `currentUser` is `null`.
-7. **Web Agent** is skipped (issue is clear from runtime state alone).
+7. **Web Agent** is to look up documentation if some issue is not clear from the information we get from DAP and static analysis.
 8. **Fix Agent** generates a null-check patch with explanation.
 9. **Reflect node** scores the patch 0.85. Passes.
 10. Terminal shows diff preview. User approves.
