@@ -1,5 +1,5 @@
 ![alt text](image.png)
-# 🍋 Lemonade AI Debugger — Architecture Plan
+#  Lemonade AI Debugger - Architecture Plan
 
 Full system overview across all 5 build phases.
 
