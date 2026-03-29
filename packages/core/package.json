@@ -1,0 +1,26 @@
+{
+  "name": "@lemonade/core",
+  "version": "0.1.0",
+  "description": "Lemonade AI Debugger — agent brain. No UI dependencies.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "dependencies": {
+    "@langchain/groq": "^0.1.0",
+    "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.2.0",
+    "zod": "^3.23.0",
+    "ripgrep-js": "^1.0.0",
+    "tree-sitter": "^0.21.0",
+    "tree-sitter-javascript": "^0.21.0",
+    "tree-sitter-python": "^0.21.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  }
+}
