@@ -147,4 +147,6 @@ LangGraph (stream agent steps) → Ink (renders each step as it arrives) → per
 
 ---
 ![alt text](image-1.png)
+
+
 *Built with [LangGraph](https://github.com/langchain-ai/langgraph) · [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/) · [Ink](https://github.com/vadimdemedes/ink)*
