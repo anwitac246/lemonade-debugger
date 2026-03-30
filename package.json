@@ -1,0 +1,8 @@
+{
+  "name": "lemonade-debugger",
+  "private": true,
+  "workspaces": [
+    "packages/cli/core",
+    "packages/cli/ui"
+  ]
+}

@@ -1,21 +1,17 @@
 /**
- * Agent: the ReAct (Reason → Act → Observe) loop.
+ * Agent: ReAct loop backed by Groq's OpenAI-compatible API.
  *
- * Architecture contract:
- *  - The agent knows nothing about the CLI rendering layer.
- *  - All progress is emitted as AgentEvent so the CLI can react without
- *    coupling to LLM SDK types.
- *  - The loop runs until the LLM produces a stop_reason of "end_turn"
- *    (no more tool calls), or until maxIterations is hit (safety valve
- *    against infinite loops caused by a confused model).
+ * Groq uses the same request/response shape as OpenAI:
+ *  - tools are passed as { type:"function", function:{name,description,parameters} }
+ *  - tool calls come back in message.tool_calls[]
+ *  - tool results are fed back as role:"tool" messages
  *
- * Why Anthropic's tool_use API rather than function calling?
- *  Anthropic's tool_use produces structured JSON input reliably and allows
- *  streaming text while tool calls are pending, which gives a better UX than
- *  waiting for the full response before showing anything.
+ * We stream so text deltas reach the UI immediately, but we buffer the full
+ * assistant message before dispatching tool calls – Groq streams the tool-call
+ * JSON incrementally in delta.tool_calls[].function.arguments.
  */
 
-import Anthropic from "@anthropic-ai/sdk";
+import Groq from "groq-sdk";
 import type {
   AgentConfig,
   AgentRunOptions,
@@ -25,27 +21,33 @@ import type {
 import { buildSystemPrompt } from "../prompt/system-prompt.js";
 import { ToolRegistry } from "../tools/tool-registry.js";
 
-type AnthropicMessage = Anthropic.MessageParam;
+// Groq message types (OpenAI-compatible)
+type ChatMessage =
+  | { role: "system"; content: string }
+  | { role: "user"; content: string }
+  | { role: "assistant"; content: string | null; tool_calls?: GroqToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string };
+
+interface GroqToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
 
 export class Agent {
-  private client: Anthropic;
-  private history: AnthropicMessage[] = [];
+  private client: Groq;
+  private history: ChatMessage[] = [];
 
   constructor(
     private readonly config: AgentConfig,
     private readonly registry: ToolRegistry
   ) {
-    this.client = new Anthropic({ apiKey: config.apiKey });
+    this.client = new Groq({ apiKey: config.apiKey });
   }
 
-  /**
-   * Process one user turn. May execute multiple tool calls internally
-   * before emitting turn_complete.
-   */
   async run(options: AgentRunOptions): Promise<void> {
     const { userMessage, onEvent, confirmTool } = options;
 
-    // Append the new user turn to persistent history.
     this.history.push({ role: "user", content: userMessage });
 
     let iterations = 0;
@@ -53,134 +55,152 @@ export class Agent {
     while (iterations < this.config.maxIterations) {
       iterations++;
 
-      // ── Stream the LLM response ──────────────────────────────────────────
-      const stream = await this.client.messages.stream({
+      const messages: ChatMessage[] = [
+        { role: "system", content: buildSystemPrompt(this.registry.names()) },
+        ...this.history,
+      ];
+
+      // ── Stream the response ──────────────────────────────────────────────
+      const stream = await this.client.chat.completions.create({
         model: this.config.model,
         max_tokens: 8192,
-        system: buildSystemPrompt(this.registry.names()),
-        tools: this.registry.toAnthropicSchemas(),
-        messages: this.history,
+        tools: this.registry.toGroqSchemas(),
+        tool_choice: "auto",
+        messages: messages as Groq.Chat.ChatCompletionMessageParam[],
+        stream: true,
       });
 
-      // Collect streamed content blocks while forwarding text deltas to UI.
-      const contentBlocks: Anthropic.ContentBlock[] = [];
-      let currentText = "";
-      let currentToolUse: {
-        id: string;
-        name: string;
-        inputJson: string;
-      } | null = null;
+      // Accumulate the full assistant message while streaming text to UI.
+      let accumulatedText = "";
+      // tool_calls are indexed by their position in the array – Groq sends
+      // index in each delta so we can reconstruct them in order.
+      const toolCallAccumulator: Record<
+        number,
+        { id: string; name: string; argumentsJson: string }
+      > = {};
+      let finishReason: string | null = null;
 
-      for await (const event of stream) {
-        if (event.type === "content_block_start") {
-          if (event.content_block.type === "tool_use") {
-            currentToolUse = {
-              id: event.content_block.id,
-              name: event.content_block.name,
-              inputJson: "",
-            };
-          } else if (event.content_block.type === "text") {
-            currentText = "";
-          }
-        } else if (event.type === "content_block_delta") {
-          if (event.delta.type === "text_delta") {
-            currentText += event.delta.text;
-            onEvent({ type: "text_delta", delta: event.delta.text });
-          } else if (event.delta.type === "input_json_delta" && currentToolUse) {
-            currentToolUse.inputJson += event.delta.partial_json;
-          }
-        } else if (event.type === "content_block_stop") {
-          if (currentToolUse) {
-            const input = JSON.parse(currentToolUse.inputJson || "{}") as Record<string, unknown>;
-            contentBlocks.push({
-              type: "tool_use",
-              id: currentToolUse.id,
-              name: currentToolUse.name,
-              input,
-            });
-            currentToolUse = null;
-          } else if (currentText !== "") {
-            contentBlocks.push({ type: "text", text: currentText });
-            currentText = "";
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta;
+        if (!delta) continue;
+
+        finishReason = chunk.choices[0]?.finish_reason ?? finishReason;
+
+        // Stream text content to UI
+        if (delta.content) {
+          accumulatedText += delta.content;
+          onEvent({ type: "text_delta", delta: delta.content });
+        }
+
+        // Accumulate tool call fragments
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            if (!toolCallAccumulator[tc.index]) {
+              toolCallAccumulator[tc.index] = {
+                id: tc.id ?? "",
+                name: tc.function?.name ?? "",
+                argumentsJson: "",
+              };
+            }
+            if (tc.id) toolCallAccumulator[tc.index]!.id = tc.id;
+            if (tc.function?.name) toolCallAccumulator[tc.index]!.name = tc.function.name;
+            if (tc.function?.arguments) {
+              toolCallAccumulator[tc.index]!.argumentsJson += tc.function.arguments;
+            }
           }
         }
       }
 
-      const finalMessage = await stream.finalMessage();
-      const stopReason = finalMessage.stop_reason;
+      const toolCalls = Object.values(toolCallAccumulator);
+      const hasToolCalls = toolCalls.length > 0;
 
-      // Record the assistant's turn in history.
-      this.history.push({ role: "assistant", content: contentBlocks });
+      // Record the assistant turn in history
+      const assistantMessage: ChatMessage = {
+        role: "assistant",
+        content: accumulatedText || null,
+        ...(hasToolCalls
+          ? {
+              tool_calls: toolCalls.map((tc) => ({
+                id: tc.id,
+                type: "function" as const,
+                function: { name: tc.name, arguments: tc.argumentsJson },
+              })),
+            }
+          : {}),
+      };
+      this.history.push(assistantMessage);
 
-      // ── No tool calls → we're done ───────────────────────────────────────
-      if (stopReason !== "tool_use") {
+      // ── No tool calls → done ─────────────────────────────────────────────
+      if (!hasToolCalls || finishReason === "stop") {
         onEvent({ type: "turn_complete" });
         return;
       }
 
-      // ── Execute all tool calls in this turn ──────────────────────────────
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      // ── Execute tool calls ───────────────────────────────────────────────
+      for (const tc of toolCalls) {
+        let input: Record<string, unknown>;
+        try {
+          input = JSON.parse(tc.argumentsJson || "{}") as Record<string, unknown>;
+        } catch {
+          input = {};
+        }
 
-      for (const block of contentBlocks) {
-        if (block.type !== "tool_use") continue;
+        onEvent({ type: "tool_call", toolName: tc.name, input });
 
-        const toolInput = block.input as Record<string, unknown>;
-        onEvent({ type: "tool_call", toolName: block.name, input: toolInput });
-
-        // Confirmation gate: only prompt for destructive tools when opted-in.
-        if (this.config.requireConfirmation && this.registry.isDestructive(block.name)) {
-          const approved = await confirmTool?.(block.name, toolInput);
+        // Confirmation gate for destructive tools
+        if (this.config.requireConfirmation && this.registry.isDestructive(tc.name)) {
+          const approved = await confirmTool?.(tc.name, input);
           if (!approved) {
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: block.id,
+            this.history.push({
+              role: "tool",
+              tool_call_id: tc.id,
               content: "User declined to run this tool.",
-              is_error: true,
             });
             onEvent({
               type: "tool_result",
-              toolName: block.name,
+              toolName: tc.name,
               result: { content: "User declined to run this tool.", isError: true },
             });
             continue;
           }
         }
 
-        const result = await this.registry.execute(block.name, toolInput);
-        onEvent({ type: "tool_result", toolName: block.name, result });
+        const result = await this.registry.execute(tc.name, input);
+        onEvent({ type: "tool_result", toolName: tc.name, result });
 
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: block.id,
+        // Each tool result is its own "tool" role message
+        this.history.push({
+          role: "tool",
+          tool_call_id: tc.id,
           content: result.content,
-          is_error: result.isError,
         });
       }
-
-      // Feed all tool results back as a single user turn so the LLM can
-      // reason about them collectively in the next iteration.
-      this.history.push({ role: "user", content: toolResults });
     }
 
-    // Safety valve: inform the user and stop rather than looping forever.
     onEvent({
       type: "error",
-      message: `Agent hit the maximum iteration limit (${this.config.maxIterations}). The task may be too complex or the model may be stuck.`,
+      message: `Agent hit the maximum iteration limit (${this.config.maxIterations}).`,
     });
     onEvent({ type: "turn_complete" });
   }
 
-  /** Resets conversation history. Does not affect tool registry or config. */
   clearHistory(): void {
     this.history = [];
   }
 
-  /** Exports history as a portable format for persistence / display. */
   getHistory(): ConversationMessage[] {
-    return this.history
-      .filter((m): m is { role: "user" | "assistant"; content: string } =>
-        typeof m.content === "string"
-      )
-      .map((m) => ({ role: m.role, content: m.content }));
+    const result: ConversationMessage[] = [];
+    for (const message of this.history) {
+      if (
+        (message.role === "user" || message.role === "assistant") &&
+        typeof message.content === "string"
+      ) {
+        result.push({
+          role: message.role,
+          content: message.content,
+        });
+      }
+    }
+    return result;
   }
 }

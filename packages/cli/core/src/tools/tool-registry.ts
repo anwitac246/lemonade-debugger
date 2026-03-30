@@ -1,14 +1,3 @@
-/**
- * ToolRegistry is the single place that maps tool names to executors.
- *
- * The agent queries this registry to:
- *  1. Build the tool schema list sent to the LLM on every request.
- *  2. Dispatch tool calls returned by the LLM.
- *
- * Keeping registration separate from the agent loop means adding a new tool
- * is a one-line change here, with zero agent code changes.
- */
-
 import type { ToolDefinition, ToolResult } from "../types.js";
 
 export class ToolRegistry {
@@ -35,7 +24,7 @@ export class ToolRegistry {
     return Array.from(this.tools.keys());
   }
 
-  /** Returns the schema array expected by the Anthropic messages API. */
+  /** Anthropic schema format (kept for reference, unused now) */
   toAnthropicSchemas(): Array<{
     name: string;
     description: string;
@@ -48,6 +37,29 @@ export class ToolRegistry {
     }));
   }
 
+  /**
+   * Groq / OpenAI function-calling schema format.
+   * Groq expects: { type:"function", function:{ name, description, parameters } }
+   * where parameters is a standard JSON Schema object.
+   */
+  toGroqSchemas(): Array<{
+    type: "function";
+    function: {
+      name: string;
+      description: string;
+      parameters: Record<string, unknown>;
+    };
+  }> {
+    return Array.from(this.tools.values()).map((t) => ({
+      type: "function" as const,
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.inputSchema,
+      },
+    }));
+  }
+
   async execute(name: string, input: unknown): Promise<ToolResult> {
     const tool = this.tools.get(name);
     if (!tool) {
@@ -57,7 +69,9 @@ export class ToolRegistry {
   }
 
   isDestructive(name: string): boolean {
-    const tool = this.tools.get(name) as (ToolDefinition<unknown> & { destructive?: boolean }) | undefined;
+    const tool = this.tools.get(name) as
+      | (ToolDefinition<unknown> & { destructive?: boolean })
+      | undefined;
     return tool?.destructive === true;
   }
 }
