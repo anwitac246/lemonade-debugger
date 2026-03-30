@@ -8,7 +8,8 @@
 		"node": ">=16"
 	},
 	"scripts": {
-		"build": "babel --out-dir=dist source",
+		"build:core": "npm --prefix ../core run build",
+		"build": "npm run build:core && babel --out-dir=dist source",
 		"dev": "npm run build && node dist/cli.js",
 		"test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
 	},

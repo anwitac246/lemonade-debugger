@@ -1,53 +1,56 @@
 /**
- * agent-bridge.js
- *
- * Loads the compiled core package and exposes a simple runAgentCommand()
- * function your app.js can call. We lazy-import so the UI stays fast on
- * startup (the agent client isn't created until first use).
+ * Lazy-loads @ai-cli/core and exposes a streaming runAgentCommand().
+ * We use a dynamic import() — the package is ESM-only and cannot be
+ * require()'d. Lazy loading keeps startup fast.
  */
 
-import { createRequire } from "node:module";
+import { createRequire } from "module";
+import { fileURLToPath } from "url";
+import path from "path";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const { createAgent } = require("@ai-cli/core");
+const dotenv = require("dotenv");
+dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
+
 
 let agent = null;
 
-function getAgent() {
-  if (!agent) {
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        "GROQ_API_KEY is not set. Add it to your .env file or shell environment."
-      );
-    }
-    agent = createAgent({ apiKey, requireConfirmation: false });
+async function getAgent() {
+  if (agent) return agent;
+
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "GROQ_API_KEY is not set. Add it to your shell environment or .env file."
+    );
   }
+
+  // Dynamic import works for both ESM and CJS consumers.
+  const { createAgent } = await import("@ai-cli/core");
+  agent = createAgent({ apiKey, requireConfirmation: false });
   return agent;
 }
 
 /**
- * Run a user message through the agent and stream output lines back via
- * the onLine callback.
+ * Run a user message through the agent, forwarding streamed events to onLine.
  *
  * @param {string} userMessage
- * @param {(line: string, type: 'text'|'tool'|'error') => void} onLine
+ * @param {(chunk: string, type: 'text'|'tool'|'error'|'meta') => void} onLine
  */
 export async function runAgentCommand(userMessage, onLine) {
-  const a = getAgent();
+  const a = await getAgent();
 
   await a.run({
     userMessage,
     onEvent(event) {
       switch (event.type) {
         case "text_delta":
-          // Stream text deltas – the caller buffers them into lines
           onLine(event.delta, "text");
           break;
         case "tool_call":
-          onLine(
-            `⚙  ${event.toolName}(${JSON.stringify(event.input)})`,
-            "tool"
-          );
+          // Show the tool invocation so the user can see what the agent is doing.
+          onLine(`⚙  ${event.toolName}(${JSON.stringify(event.input)})`, "tool");
           break;
         case "tool_result":
           onLine(
@@ -59,12 +62,13 @@ export async function runAgentCommand(userMessage, onLine) {
           onLine(`Error: ${event.message}`, "error");
           break;
         case "turn_complete":
-          // sentinel so app.js knows streaming is done
+          // Sentinel so app.js knows the stream is done.
           onLine("\x00TURN_COMPLETE", "meta");
           break;
       }
     },
-    // No interactive confirm in UI mode – destructive tools run freely
+    // Destructive tool confirmation is disabled in UI mode — the user
+    // already invoked the command intentionally.
     confirmTool: async () => true,
   });
 }

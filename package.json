@@ -4,5 +4,8 @@
   "workspaces": [
     "packages/cli/core",
     "packages/cli/ui"
-  ]
+  ],
+  "dependencies": {
+    "dotenv": "^17.3.1"
+  }
 }
