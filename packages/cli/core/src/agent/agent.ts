@@ -1,14 +1,7 @@
 /**
- * Agent: ReAct loop backed by Groq's OpenAI-compatible API.
- *
- * Groq uses the same request/response shape as OpenAI:
- *  - tools are passed as { type:"function", function:{name,description,parameters} }
- *  - tool calls come back in message.tool_calls[]
- *  - tool results are fed back as role:"tool" messages
- *
- * We stream so text deltas reach the UI immediately, but we buffer the full
- * assistant message before dispatching tool calls – Groq streams the tool-call
- * JSON incrementally in delta.tool_calls[].function.arguments.
+ * Agent: ReAct loop backed by Groq streaming API.
+ * Now with MongoDB persistence, proper error recovery,
+ * and clean session lifecycle.
  */
 
 import Groq from "groq-sdk";
@@ -20,8 +13,9 @@ import type {
 } from "../types.js";
 import { buildSystemPrompt } from "../prompt/system-prompt.js";
 import { ToolRegistry } from "../tools/tool-registry.js";
+import { saveMessage, getMessages } from "../db/message-store.js";
+import { touchSession } from "../db/session-store.js";
 
-// Groq message types (OpenAI-compatible)
 type ChatMessage =
   | { role: "system"; content: string }
   | { role: "user"; content: string }
@@ -37,6 +31,7 @@ interface GroqToolCall {
 export class Agent {
   private client: Groq;
   private history: ChatMessage[] = [];
+  private sessionId?: string;
 
   constructor(
     private readonly config: AgentConfig,
@@ -45,10 +40,35 @@ export class Agent {
     this.client = new Groq({ apiKey: config.apiKey });
   }
 
+  setSession(sessionId: string): void {
+    this.sessionId = sessionId;
+  }
+
+  /** Reload history from DB for a given session. */
+  async loadSession(sessionId: string): Promise<void> {
+    this.sessionId = sessionId;
+    const stored = await getMessages(sessionId);
+    this.history = stored
+      .filter((m) => m.role !== "tool")
+      .map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      }));
+  }
+
   async run(options: AgentRunOptions): Promise<void> {
     const { userMessage, onEvent, confirmTool } = options;
 
     this.history.push({ role: "user", content: userMessage });
+
+    if (this.sessionId) {
+      await saveMessage({
+        sessionId: this.sessionId,
+        role: "user",
+        content: userMessage,
+      });
+      await touchSession(this.sessionId);
+    }
 
     let iterations = 0;
 
@@ -60,20 +80,24 @@ export class Agent {
         ...this.history,
       ];
 
-      // ── Stream the response ──────────────────────────────────────────────
-      const stream = await this.client.chat.completions.create({
-        model: this.config.model,
-        max_tokens: 8192,
-        tools: this.registry.toGroqSchemas(),
-        tool_choice: "auto",
-        messages: messages as Groq.Chat.ChatCompletionMessageParam[],
-        stream: true,
-      });
+      let stream: AsyncIterable<Groq.Chat.ChatCompletionChunk>;
+      try {
+        stream = await this.client.chat.completions.create({
+          model: this.config.model,
+          max_tokens: 8192,
+          tools: this.registry.toGroqSchemas(),
+          tool_choice: "auto",
+          messages: messages as Groq.Chat.ChatCompletionMessageParam[],
+          stream: true,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        onEvent({ type: "error", message: `Groq API error: ${msg}` });
+        onEvent({ type: "turn_complete" });
+        return;
+      }
 
-      // Accumulate the full assistant message while streaming text to UI.
       let accumulatedText = "";
-      // tool_calls are indexed by their position in the array – Groq sends
-      // index in each delta so we can reconstruct them in order.
       const toolCallAccumulator: Record<
         number,
         { id: string; name: string; argumentsJson: string }
@@ -83,30 +107,26 @@ export class Agent {
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta;
         if (!delta) continue;
-
         finishReason = chunk.choices[0]?.finish_reason ?? finishReason;
 
-        // Stream text content to UI
         if (delta.content) {
           accumulatedText += delta.content;
           onEvent({ type: "text_delta", delta: delta.content });
         }
 
-        // Accumulate tool call fragments
         if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
+          for (const tc of delta.tool_calls as Array<{
+            index: number;
+            id?: string;
+            function?: { name?: string; arguments?: string };
+          }>) {
             if (!toolCallAccumulator[tc.index]) {
-              toolCallAccumulator[tc.index] = {
-                id: tc.id ?? "",
-                name: tc.function?.name ?? "",
-                argumentsJson: "",
-              };
+              toolCallAccumulator[tc.index] = { id: "", name: "", argumentsJson: "" };
             }
-            if (tc.id) toolCallAccumulator[tc.index]!.id = tc.id;
-            if (tc.function?.name) toolCallAccumulator[tc.index]!.name = tc.function.name;
-            if (tc.function?.arguments) {
-              toolCallAccumulator[tc.index]!.argumentsJson += tc.function.arguments;
-            }
+            const acc = toolCallAccumulator[tc.index]!;
+            if (tc.id) acc.id = tc.id;
+            if (tc.function?.name) acc.name = tc.function.name;
+            if (tc.function?.arguments) acc.argumentsJson += tc.function.arguments;
           }
         }
       }
@@ -114,7 +134,6 @@ export class Agent {
       const toolCalls = Object.values(toolCallAccumulator);
       const hasToolCalls = toolCalls.length > 0;
 
-      // Record the assistant turn in history
       const assistantMessage: ChatMessage = {
         role: "assistant",
         content: accumulatedText || null,
@@ -130,13 +149,19 @@ export class Agent {
       };
       this.history.push(assistantMessage);
 
-      // ── No tool calls → done ─────────────────────────────────────────────
+      if (accumulatedText && this.sessionId) {
+        await saveMessage({
+          sessionId: this.sessionId,
+          role: "assistant",
+          content: accumulatedText,
+        });
+      }
+
       if (!hasToolCalls || finishReason === "stop") {
         onEvent({ type: "turn_complete" });
         return;
       }
 
-      // ── Execute tool calls ───────────────────────────────────────────────
       for (const tc of toolCalls) {
         let input: Record<string, unknown>;
         try {
@@ -147,19 +172,15 @@ export class Agent {
 
         onEvent({ type: "tool_call", toolName: tc.name, input });
 
-        // Confirmation gate for destructive tools
         if (this.config.requireConfirmation && this.registry.isDestructive(tc.name)) {
           const approved = await confirmTool?.(tc.name, input);
           if (!approved) {
-            this.history.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: "User declined to run this tool.",
-            });
+            const declined = "User declined to run this tool.";
+            this.history.push({ role: "tool", tool_call_id: tc.id, content: declined });
             onEvent({
               type: "tool_result",
               toolName: tc.name,
-              result: { content: "User declined to run this tool.", isError: true },
+              result: { content: declined, isError: true },
             });
             continue;
           }
@@ -168,12 +189,17 @@ export class Agent {
         const result = await this.registry.execute(tc.name, input);
         onEvent({ type: "tool_result", toolName: tc.name, result });
 
-        // Each tool result is its own "tool" role message
-        this.history.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: result.content,
-        });
+        this.history.push({ role: "tool", tool_call_id: tc.id, content: result.content });
+
+        if (this.sessionId) {
+          await saveMessage({
+            sessionId: this.sessionId,
+            role: "tool",
+            content: result.content,
+            toolName: tc.name,
+            isError: result.isError,
+          });
+        }
       }
     }
 
@@ -189,18 +215,12 @@ export class Agent {
   }
 
   getHistory(): ConversationMessage[] {
-    const result: ConversationMessage[] = [];
-    for (const message of this.history) {
-      if (
-        (message.role === "user" || message.role === "assistant") &&
-        typeof message.content === "string"
-      ) {
-        result.push({
-          role: message.role,
-          content: message.content,
-        });
-      }
-    }
-    return result;
+    return this.history
+      .filter(
+        (m): m is { role: "user" | "assistant"; content: string } =>
+          (m.role === "user" || m.role === "assistant") &&
+          typeof m.content === "string"
+      )
+      .map((m) => ({ role: m.role, content: m.content }));
   }
 }

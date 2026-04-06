@@ -9,6 +9,7 @@ import {
   makeContinueExecutionTool,
 } from "../tools/dap-tools.js";
 import { DAPSession } from "../dap/dap-session.js";
+import { createSession } from "../db/session-store.js";
 import type { AgentConfig, ToolDefinition } from "../types.js";
 
 export interface CreateAgentOptions {
@@ -16,15 +17,25 @@ export interface CreateAgentOptions {
   model?: string;
   maxIterations?: number;
   requireConfirmation?: boolean;
+  /** Pass an existing sessionId to resume a session. */
+  sessionId?: string;
+  /** Skip DB entirely (useful in tests). */
+  noDb?: boolean;
 }
 
-export function createAgent(options: CreateAgentOptions): Agent {
+export interface AgentWithSession {
+  agent: Agent;
+  sessionId: string;
+}
+
+export async function createAgent(
+  options: CreateAgentOptions
+): Promise<AgentWithSession> {
   const config: AgentConfig = {
     apiKey: options.apiKey,
-    // llama-3.3-70b-versatile is Groq's best model for tool use + long context
     model: options.model ?? "llama-3.3-70b-versatile",
     maxIterations: options.maxIterations ?? 20,
-    requireConfirmation: options.requireConfirmation ?? true,
+    requireConfirmation: options.requireConfirmation ?? false,
   };
 
   const dapSession = new DAPSession();
@@ -39,5 +50,18 @@ export function createAgent(options: CreateAgentOptions): Agent {
     makeContinueExecutionTool(dapSession) as ToolDefinition<unknown>,
   ]);
 
-  return new Agent(config, registry);
+  const agent = new Agent(config, registry);
+
+  let sessionId: string;
+  if (options.noDb) {
+    sessionId = `local-${Date.now()}`;
+  } else if (options.sessionId) {
+    sessionId = options.sessionId;
+    await agent.loadSession(sessionId);
+  } else {
+    sessionId = await createSession(config.model);
+    agent.setSession(sessionId);
+  }
+
+  return { agent, sessionId };
 }
