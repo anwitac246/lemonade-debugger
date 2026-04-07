@@ -1,3 +1,10 @@
+/**
+ * Agent factory.
+ *
+ * Wires together: config, tools, DAP session, optional DB.
+ * The UI layer only needs to call createAgent() and then agent.run().
+ */
+
 import { Agent } from "./agent.js";
 import { ToolRegistry } from "../tools/tool-registry.js";
 import { readFileTool, searchCodeTool } from "../tools/file-tools.js";
@@ -7,6 +14,7 @@ import {
   makeGetStackTraceTool,
   makeGetVariablesTool,
   makeContinueExecutionTool,
+  makeSetBreakpointTool,
 } from "../tools/dap-tools.js";
 import { DAPSession } from "../dap/dap-session.js";
 import { createSession } from "../db/session-store.js";
@@ -16,25 +24,32 @@ export interface CreateAgentOptions {
   apiKey: string;
   model?: string;
   maxIterations?: number;
+  maxTokens?: number;
+  temperature?: number;
   requireConfirmation?: boolean;
-  /** Pass an existing sessionId to resume a session. */
+  /** Resume an existing session by ID */
   sessionId?: string;
-  /** Skip DB entirely (useful in tests). */
+  /** Skip DB (local/offline mode) */
   noDb?: boolean;
 }
 
-export interface AgentWithSession {
+export interface AgentHandle {
   agent: Agent;
   sessionId: string;
+  registry: ToolRegistry;
+  dapSession: DAPSession;
+  cleanup(): void;
 }
 
 export async function createAgent(
   options: CreateAgentOptions
-): Promise<AgentWithSession> {
+): Promise<AgentHandle> {
   const config: AgentConfig = {
     apiKey: options.apiKey,
     model: options.model ?? "llama-3.3-70b-versatile",
-    maxIterations: options.maxIterations ?? 20,
+    maxIterations: options.maxIterations ?? 25,
+    maxTokens: options.maxTokens ?? 8192,
+    temperature: options.temperature ?? 0.2,
     requireConfirmation: options.requireConfirmation ?? false,
   };
 
@@ -48,20 +63,36 @@ export async function createAgent(
     makeGetStackTraceTool(dapSession) as ToolDefinition<unknown>,
     makeGetVariablesTool(dapSession) as ToolDefinition<unknown>,
     makeContinueExecutionTool(dapSession) as ToolDefinition<unknown>,
+    makeSetBreakpointTool(dapSession) as ToolDefinition<unknown>,
   ]);
 
   const agent = new Agent(config, registry);
 
   let sessionId: string;
+
   if (options.noDb) {
     sessionId = `local-${Date.now()}`;
   } else if (options.sessionId) {
     sessionId = options.sessionId;
     await agent.loadSession(sessionId);
   } else {
-    sessionId = await createSession(config.model);
-    agent.setSession(sessionId);
+    try {
+      sessionId = await createSession(config.model);
+      agent.setSession(sessionId);
+    } catch {
+      // DB unavailable — fall back to local session
+      sessionId = `local-${Date.now()}`;
+      agent.setSession(sessionId);
+    }
   }
 
-  return { agent, sessionId };
+  return {
+    agent,
+    sessionId,
+    registry,
+    dapSession,
+    cleanup() {
+      dapSession.terminate();
+    },
+  };
 }

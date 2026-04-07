@@ -1,61 +1,120 @@
 /**
- * DAPSession wraps DAPClient and manages the lifecycle of a single debug
- * session (launch → pause → inspect → continue → terminate).
+ * DAPSession: High-level debug session lifecycle manager.
  *
- * Tools talk to DAPSession, not DAPClient directly, so that:
- *  - Session state (active thread, launch config) is centralized.
- *  - DAPClient stays a pure protocol driver with no business logic.
+ * Wraps DAPClient and handles:
+ * - Multi-language adapter configuration
+ * - Thread tracking
+ * - Graceful error recovery
  */
 
 import { DAPClient, type DAPTransport } from "./dap-client.js";
-import type { DAPStackFrame, DAPVariable } from "../types.js";
+import type { DAPStackFrame, DAPVariable, DAPLanguage } from "../types.js";
 
-type SupportedLanguage = "python" | "node" | "go";
+type AdapterConfig = {
+  transport: DAPTransport;
+  program: string;
+  programArgs?: string[];
+};
 
-const ADAPTER_CONFIGS: Record<SupportedLanguage, (file: string) => { transport: DAPTransport; program: string }> = {
-  python: (file) => ({
-    transport: { kind: "stdio", command: "python3", args: ["-m", "debugpy.adapter"] },
+const ADAPTER_FACTORY: Record<
+  DAPLanguage,
+  (file: string, args?: string[]) => AdapterConfig
+> = {
+  python: (file, args) => ({
+    transport: {
+      kind: "stdio",
+      command: "python3",
+      args: ["-m", "debugpy.adapter"],
+    },
     program: file,
+    programArgs: args,
   }),
-  node: (file) => ({
+  node: (file, args) => ({
+    // js-debug runs as a DAP server on a user-specified port
     transport: { kind: "tcp", host: "127.0.0.1", port: 9229 },
     program: file,
+    programArgs: args,
   }),
-  go: (file) => ({
-    // Delve runs as a DAP server on a fixed port by convention.
+  go: (file, args) => ({
+    // Delve runs as a DAP server
     transport: { kind: "tcp", host: "127.0.0.1", port: 2345 },
     program: file,
+    programArgs: args,
+  }),
+  rust: (file, args) => ({
+    // CodeLLDB or lldb-vscode
+    transport: { kind: "tcp", host: "127.0.0.1", port: 13000 },
+    program: file,
+    programArgs: args,
+  }),
+  java: (file, args) => ({
+    // java-debug (vscode-java-debug)
+    transport: { kind: "tcp", host: "127.0.0.1", port: 5005 },
+    program: file,
+    programArgs: args,
   }),
 };
+
+interface BreakpointOptions {
+  condition?: string;
+  logMessage?: string;
+  hitCondition?: string;
+}
 
 export class DAPSession {
   private client: DAPClient | null = null;
   private activeThreadId: number | null = null;
-  private isInitialized = false;
+  private isRunning = false;
+  private currentFile: string | null = null;
 
-  async start(file: string, language: SupportedLanguage): Promise<string> {
-    const cfg = ADAPTER_CONFIGS[language];
-    if (!cfg) {
-      throw new Error(`Unsupported language: ${language}. Supported: ${Object.keys(ADAPTER_CONFIGS).join(", ")}`);
+  // ── Public API ────────────────────────────────────────────────────────────
+
+  async start(
+    file: string,
+    language: DAPLanguage,
+    args?: string[],
+    stopOnEntry = true
+  ): Promise<string> {
+    const factory = ADAPTER_FACTORY[language];
+    if (!factory) {
+      throw new Error(
+        `Unsupported language: "${language}". Supported: ${Object.keys(ADAPTER_FACTORY).join(", ")}`
+      );
     }
 
-    const { transport, program } = cfg(file);
+    // Terminate any existing session
+    this.terminate();
+
+    const { transport, program, programArgs } = factory(file, args);
 
     this.client = new DAPClient();
     await this.client.connect(transport);
     await this.client.initialize();
 
-    // Listen for the first "stopped" event to capture the active thread.
-    // We do this before launch so we don't miss a stopOnEntry event.
-    const stopPromise = this.client.waitForStop(15_000);
+    this.currentFile = file;
 
-    await this.client.launch(program, [], /* stopOnEntry */ true);
+    // Listen for initial stop BEFORE launch
+    const stopPromise = this.client.waitForStop(20_000);
 
-    const { threadId } = await stopPromise;
+    await this.client.launch(program, programArgs ?? [], stopOnEntry);
+
+    const { threadId, reason } = await stopPromise;
     this.activeThreadId = threadId;
-    this.isInitialized = true;
+    this.isRunning = true;
 
-    return `Debug session started for ${file} (${language}). Stopped at entry point, thread ${threadId}.`;
+    return (
+      `Debug session started: ${file} (${language})\n` +
+      `Stopped at entry — thread ${threadId}, reason: ${reason}`
+    );
+  }
+
+  async setBreakpoint(
+    file: string,
+    line: number,
+    options: BreakpointOptions = {}
+  ): Promise<void> {
+    this.assertReady();
+    await this.client!.setBreakpoint(file, line, options);
   }
 
   async getStackTrace(): Promise<DAPStackFrame[]> {
@@ -68,29 +127,41 @@ export class DAPSession {
     return this.client!.getVariables(frameId);
   }
 
-  async continueExecution(): Promise<string> {
+  async continueExecution(timeoutMs = 30_000): Promise<string> {
     this.assertReady();
     await this.client!.continueExecution(this.activeThreadId!);
 
-    // Wait for the next stop (breakpoint / exception / end).
     try {
-      const { reason } = await this.client!.waitForStop(30_000);
-      return `Execution resumed and stopped again. Reason: ${reason}.`;
+      const { reason, threadId } = await this.client!.waitForStop(timeoutMs);
+      this.activeThreadId = threadId;
+      return `Execution resumed and paused again. Reason: ${reason} (thread ${threadId}).`;
     } catch {
-      // Program may have exited without stopping – that's normal.
-      return "Execution resumed. Program may have finished.";
+      // Program exited without stopping — normal end of execution
+      this.isRunning = false;
+      return "Execution resumed. Program appears to have finished.";
     }
   }
 
   terminate(): void {
-    this.client?.disconnect();
+    try {
+      this.client?.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
     this.client = null;
     this.activeThreadId = null;
-    this.isInitialized = false;
+    this.isRunning = false;
+    this.currentFile = null;
   }
 
+  get active(): boolean {
+    return this.isRunning && this.client !== null;
+  }
+
+  // ── Private ────────────────────────────────────────────────────────────────
+
   private assertReady(): void {
-    if (!this.isInitialized || !this.client || this.activeThreadId === null) {
+    if (!this.isRunning || !this.client || this.activeThreadId === null) {
       throw new Error(
         "No active debug session. Call start_debugger first."
       );

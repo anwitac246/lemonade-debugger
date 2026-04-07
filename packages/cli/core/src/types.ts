@@ -1,24 +1,25 @@
 /**
- * Shared type contracts. Kept in one file so both layers import a single
- * source of truth and never drift apart.
+ * Shared type contracts.
+ * Single source of truth for all layers.
  */
+
+// ─── Tool System ──────────────────────────────────────────────────────────────
 
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
-  inputSchema: Record<string, unknown>; // JSON Schema (draft-07)
+  inputSchema: Record<string, unknown>; // JSON Schema draft-07
   execute(input: TInput): Promise<ToolResult>;
+  destructive?: boolean;
 }
 
 export interface ToolResult {
-  /** Machine-readable output handed back to the LLM. */
   content: string;
-  /** True when the tool produced an error – the LLM gets to see the error
-   *  message so it can self-correct rather than silently looping. */
   isError: boolean;
 }
 
-/** A single turn in the conversation handed to the LLM. */
+// ─── Conversation ──────────────────────────────────────────────────────────────
+
 export type MessageRole = "user" | "assistant";
 
 export interface ConversationMessage {
@@ -26,38 +27,66 @@ export interface ConversationMessage {
   content: string;
 }
 
-/** Emitted by the agent so the CLI layer can render progress without
- *  understanding the ReAct loop internals. */
+// ─── Agent Events (streaming) ─────────────────────────────────────────────────
+
 export type AgentEvent =
   | { type: "text_delta"; delta: string }
-  | { type: "tool_call"; toolName: string; input: unknown }
-  | { type: "tool_result"; toolName: string; result: ToolResult }
-  | { type: "turn_complete" }
-  | { type: "error"; message: string };
+  | { type: "tool_call"; toolName: string; input: unknown; callId: string }
+  | { type: "tool_result"; toolName: string; result: ToolResult; callId: string }
+  | { type: "turn_complete"; totalTokens?: number }
+  | { type: "error"; message: string; fatal?: boolean }
+  | { type: "thinking"; content: string };
+
+// ─── Agent Config ─────────────────────────────────────────────────────────────
 
 export interface AgentConfig {
   model: string;
   maxIterations: number;
-  /** Ask the CLI layer for confirmation before mutating operations. */
   requireConfirmation: boolean;
   apiKey: string;
+  /** Max tokens per LLM call */
+  maxTokens?: number;
+  /** Temperature (0-1). Default 0.2 for coding tasks */
+  temperature?: number;
 }
 
-/** Passed from CLI to agent for each user turn. */
 export interface AgentRunOptions {
   userMessage: string;
   onEvent: (event: AgentEvent) => void;
-  /** Resolve to true = proceed, false = cancel. Only called when
-   *  AgentConfig.requireConfirmation is true and the tool is destructive. */
   confirmTool?: (toolName: string, input: unknown) => Promise<boolean>;
+  /** Abort signal to cancel mid-run */
+  signal?: AbortSignal;
 }
 
-// ─── DAP types (subset of the Debug Adapter Protocol spec) ─────────────────
+// ─── Context / File Retrieval ─────────────────────────────────────────────────
+
+export interface FileContext {
+  path: string;
+  content: string;
+  relevanceScore: number;
+  startLine?: number;
+  endLine?: number;
+}
+
+export interface ContextRetrievalOptions {
+  query: string;
+  workingDir: string;
+  maxFiles?: number;
+  maxBytesPerFile?: number;
+  includeGlobs?: string[];
+  excludeGlobs?: string[];
+}
+
+// ─── DAP (Debug Adapter Protocol) ────────────────────────────────────────────
 
 export interface DAPCapabilities {
   supportsConfigurationDoneRequest?: boolean;
   supportsFunctionBreakpoints?: boolean;
   supportsConditionalBreakpoints?: boolean;
+  supportsHitConditionalBreakpoints?: boolean;
+  supportsLogPoints?: boolean;
+  supportsRestartRequest?: boolean;
+  supportsTerminateRequest?: boolean;
 }
 
 export interface DAPStackFrame {
@@ -66,6 +95,7 @@ export interface DAPStackFrame {
   source?: { path?: string; name?: string };
   line: number;
   column: number;
+  presentationHint?: "normal" | "label" | "subtle";
 }
 
 export interface DAPVariable {
@@ -73,9 +103,45 @@ export interface DAPVariable {
   value: string;
   type?: string;
   variablesReference: number;
+  namedVariables?: number;
+  indexedVariables?: number;
+  evaluateName?: string;
 }
 
 export interface DAPThread {
   id: number;
   name: string;
+}
+
+export interface DAPBreakpoint {
+  id?: number;
+  verified: boolean;
+  message?: string;
+  source?: { path?: string };
+  line?: number;
+}
+
+export type DAPLanguage = "python" | "node" | "go" | "rust" | "java";
+
+// ─── Session / DB ─────────────────────────────────────────────────────────────
+
+export interface SessionMetadata {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+  model: string;
+  messageCount: number;
+  title?: string;
+}
+
+export interface StoredMessage {
+  id?: string;
+  sessionId: string;
+  role: MessageRole | "tool";
+  content: string;
+  toolName?: string;
+  toolCallId?: string;
+  isError?: boolean;
+  createdAt: Date;
+  tokens?: number;
 }
