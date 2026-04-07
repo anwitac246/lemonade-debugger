@@ -1,12 +1,12 @@
 /**
- * Agent: Production-grade ReAct loop.
+ * Agent: Production-grade ReAct loop over Groq's streaming API.
  *
  * Key design decisions:
- * - Streaming first: text deltas flow to UI immediately
- * - Abort-aware: respects AbortSignal at every async boundary
- * - Tool parallelism: independent tool calls run concurrently
- * - History compaction: avoids token limit blowup in long sessions
- * - Typed errors: distinct fatal vs. recoverable error paths
+ * - tool_choice is "auto" only when tools are registered (Groq rejects it otherwise).
+ * - Streaming first: text deltas flow to the UI immediately.
+ * - Abort-aware: checks AbortSignal at every async boundary.
+ * - Safe tools run in parallel; destructive tools run sequentially.
+ * - History compaction keeps the context window from blowing up in long sessions.
  */
 
 import Groq from "groq-sdk";
@@ -22,7 +22,7 @@ import { ToolRegistry } from "../tools/tool-registry.js";
 import { saveMessage, getMessages } from "../db/message-store.js";
 import { touchSession } from "../db/session-store.js";
 
-// ─── Internal types ────────────────────────────────────────────────────────────
+// ─── Internal types ───────────────────────────────────────────────────────────
 
 type ChatMessage =
   | { role: "system"; content: string }
@@ -43,13 +43,7 @@ interface AccumulatedToolCall {
   index: number;
 }
 
-// Groq streams usage only when stream_options.include_usage is true;
-// extend the chunk type to reflect that.
-type ChatCompletionChunkWithUsage = Groq.Chat.ChatCompletionChunk & {
-  usage?: { total_tokens: number };
-};
-
-// Maximum history messages to keep in memory (old ones get summarized)
+// Max messages to keep in the in-memory history before compacting.
 const MAX_HISTORY_MESSAGES = 40;
 
 // ─── Agent ────────────────────────────────────────────────────────────────────
@@ -66,7 +60,7 @@ export class Agent {
     this.client = new Groq({ apiKey: config.apiKey });
   }
 
-  // ── Session lifecycle ──────────────────────────────────────────────────────
+  // ── Session lifecycle ─────────────────────────────────────────────────────
 
   setSession(sessionId: string): void {
     this.sessionId = sessionId;
@@ -75,14 +69,10 @@ export class Agent {
   async loadSession(sessionId: string): Promise<void> {
     this.sessionId = sessionId;
     const stored = await getMessages(sessionId);
-
-    // Reconstruct history excluding tool messages (those are ephemeral context)
+    // Reconstruct only user/assistant turns; tool messages are ephemeral context.
     this.history = stored
       .filter((m) => m.role === "user" || m.role === "assistant")
-      .map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      }));
+      .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
   }
 
   clearHistory(): void {
@@ -93,28 +83,26 @@ export class Agent {
     return this.history
       .filter(
         (m): m is { role: "user" | "assistant"; content: string } =>
-          (m.role === "user" || m.role === "assistant") &&
-          typeof m.content === "string"
+          (m.role === "user" || m.role === "assistant") && typeof m.content === "string"
       )
       .map((m) => ({ role: m.role, content: m.content }));
   }
 
-  // ── Main run loop ──────────────────────────────────────────────────────────
+  // ── Main run loop ─────────────────────────────────────────────────────────
 
   async run(options: AgentRunOptions): Promise<void> {
     const { userMessage, onEvent, confirmTool, signal } = options;
 
-    // 1. Persist user message
+    // 1. Persist and record the user turn.
     this.history.push({ role: "user", content: userMessage });
     if (this.sessionId) {
       await this.persistMessage({ role: "user", content: userMessage });
       await touchSession(this.sessionId).catch(() => undefined);
     }
 
-    // 2. Retrieve relevant file context (non-blocking, best-effort)
+    // 2. Retrieve relevant file context — best-effort, never crashes the agent.
     let contextSection: string | undefined;
     try {
-      // Dynamic import so a missing module doesn't crash the whole agent
       const { retrieveContext, formatContextForPrompt } = await import(
         "../context/retrieval.js"
       );
@@ -128,7 +116,7 @@ export class Agent {
         contextSection = formatContextForPrompt(contexts, process.cwd());
       }
     } catch {
-      // Context retrieval failure is non-fatal
+      // Non-fatal — agent still works without file context.
     }
 
     const systemPrompt = buildSystemPrompt({
@@ -139,58 +127,57 @@ export class Agent {
       shell: process.env.SHELL ?? process.env.ComSpec,
     });
 
-    // 3. ReAct loop
-    let iterations = 0;
-
-    while (iterations < this.config.maxIterations) {
+    // 3. ReAct loop — model reasons, calls tools, reasons again until done.
+    for (let iteration = 0; iteration < this.config.maxIterations; iteration++) {
       if (signal?.aborted) {
         onEvent({ type: "error", message: "Aborted by user.", fatal: true });
         onEvent({ type: "turn_complete" });
         return;
       }
 
-      iterations++;
-
-      // Compact history if it's getting long
       const messages = this.buildMessages(systemPrompt);
+      const hasTools = this.registry.size() > 0;
 
-      // 4. Stream LLM response
+      // Build the API request. Only include tools/tool_choice when tools exist —
+      // Groq returns 400 if tool_choice is sent without a non-empty tools array.
+      const requestParams = {
+        model: this.config.model,
+        max_tokens: this.config.maxTokens ?? 8192,
+        temperature: this.config.temperature ?? 0.2,
+        messages: messages as Groq.Chat.ChatCompletionMessageParam[],
+        stream: true as const,
+        ...(hasTools && {
+          tools: this.registry.toGroqSchemas(),
+          tool_choice: "auto" as const,
+        }),
+      };
+
       let stream: AsyncIterable<Groq.Chat.ChatCompletionChunk>;
       try {
-        stream = await this.client.chat.completions.create({
-          model: this.config.model,
-          max_tokens: this.config.maxTokens ?? 8192,
-          temperature: this.config.temperature ?? 0.2,
-          tools: this.registry.toGroqSchemas(),
-          tool_choice: "auto",
-          messages: messages as Groq.Chat.ChatCompletionMessageParam[],
-          stream: true,
-          // stream_options: { include_usage: true },
-        });
+        stream = await this.client.chat.completions.create(
+          requestParams
+        ) as unknown as AsyncIterable<Groq.Chat.ChatCompletionChunk>;
       } catch (err) {
-        const msg = this.formatError(err);
+        const msg = err instanceof Error ? err.message : String(err);
         onEvent({ type: "error", message: `API error: ${msg}`, fatal: true });
         onEvent({ type: "turn_complete" });
         return;
       }
 
-      // 5. Collect streaming response
+      // 4. Collect the streaming response: accumulate text and tool calls.
       const { text, toolCalls, finishReason, totalTokens } =
         await this.collectStream(stream, onEvent, signal);
 
-      // 6. Build assistant message
       const assistantMsg: ChatMessage = {
         role: "assistant",
         content: text || null,
-        ...(toolCalls.length > 0
-          ? {
-              tool_calls: toolCalls.map((tc) => ({
-                id: tc.id,
-                type: "function" as const,
-                function: { name: tc.name, arguments: tc.argumentsJson },
-              })),
-            }
-          : {}),
+        ...(toolCalls.length > 0 && {
+          tool_calls: toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function" as const,
+            function: { name: tc.name, arguments: tc.argumentsJson },
+          })),
+        }),
       };
       this.history.push(assistantMsg);
 
@@ -198,35 +185,32 @@ export class Agent {
         await this.persistMessage({ role: "assistant", content: text });
       }
 
-      // 7. No tool calls → done
+      // 5. No tool calls (or explicit stop) means the model is done.
       if (toolCalls.length === 0 || finishReason === "stop") {
         onEvent({ type: "turn_complete", totalTokens });
         return;
       }
 
-      // 8. Execute tools (parallel where safe, sequential for destructive)
+      // 6. Execute tool calls, append results to history, then loop.
       await this.executeToolCalls(toolCalls, onEvent, confirmTool, signal);
-
-      // Loop continues → model sees tool results and responds again
     }
 
     onEvent({
       type: "error",
-      message: `Reached maximum iterations (${this.config.maxIterations}). The task may be too complex for a single run.`,
+      message: `Reached maximum iterations (${this.config.maxIterations}).`,
     });
     onEvent({ type: "turn_complete" });
   }
 
-  // ── Private helpers ────────────────────────────────────────────────────────
+  // ── Private helpers ───────────────────────────────────────────────────────
 
   private buildMessages(systemPrompt: string): ChatMessage[] {
-    // Compact: if history is very long, keep system + last N messages
-    const historyToUse =
+    // Keep only the most recent N messages to avoid context overflow.
+    const trimmed =
       this.history.length > MAX_HISTORY_MESSAGES
         ? this.history.slice(-MAX_HISTORY_MESSAGES)
         : this.history;
-
-    return [{ role: "system", content: systemPrompt }, ...historyToUse];
+    return [{ role: "system", content: systemPrompt }, ...trimmed];
   }
 
   private async collectStream(
@@ -240,7 +224,7 @@ export class Agent {
     totalTokens?: number;
   }> {
     let text = "";
-    const toolCallAccumulator: Record<number, AccumulatedToolCall> = {};
+    const accumulator: Record<number, AccumulatedToolCall> = {};
     let finishReason: string | null = null;
     let totalTokens: number | undefined;
 
@@ -251,7 +235,6 @@ export class Agent {
       if (!choice) continue;
 
       finishReason = choice.finish_reason ?? finishReason;
-
       const delta = choice.delta;
       if (!delta) continue;
 
@@ -260,39 +243,33 @@ export class Agent {
         onEvent({ type: "text_delta", delta: delta.content });
       }
 
+      // Accumulate streamed tool call fragments by their index.
       if (delta.tool_calls) {
         for (const tc of delta.tool_calls as Array<{
           index: number;
           id?: string;
           function?: { name?: string; arguments?: string };
         }>) {
-          if (!toolCallAccumulator[tc.index]) {
-            toolCallAccumulator[tc.index] = {
-              id: "",
-              name: "",
-              argumentsJson: "",
-              index: tc.index,
-            };
+          if (!accumulator[tc.index]) {
+            accumulator[tc.index] = { id: "", name: "", argumentsJson: "", index: tc.index };
           }
-          const acc = toolCallAccumulator[tc.index]!;
+          const acc = accumulator[tc.index]!;
           if (tc.id) acc.id = tc.id;
           if (tc.function?.name) acc.name = tc.function.name;
           if (tc.function?.arguments) acc.argumentsJson += tc.function.arguments;
         }
       }
 
-      // usage is present on the final chunk when stream_options.include_usage is true
-      const chunkWithUsage = chunk as ChatCompletionChunkWithUsage;
-      if (chunkWithUsage.usage) {
-        totalTokens = chunkWithUsage.usage.total_tokens;
-      }
+      // Groq includes usage on the final chunk when stream_options.include_usage is set.
+      const withUsage = chunk as Groq.Chat.ChatCompletionChunk & {
+        usage?: { total_tokens: number };
+      };
+      if (withUsage.usage) totalTokens = withUsage.usage.total_tokens;
     }
 
     return {
       text,
-      toolCalls: Object.values(toolCallAccumulator).sort(
-        (a, b) => a.index - b.index
-      ),
+      toolCalls: Object.values(accumulator).sort((a, b) => a.index - b.index),
       finishReason,
       totalTokens,
     };
@@ -304,41 +281,28 @@ export class Agent {
     confirmTool?: (name: string, input: unknown) => Promise<boolean>,
     signal?: AbortSignal
   ): Promise<void> {
-    // Separate destructive from safe tools
-    const destructive = toolCalls.filter((tc) =>
-      this.registry.isDestructive(tc.name)
-    );
-    const safe = toolCalls.filter(
-      (tc) => !this.registry.isDestructive(tc.name)
-    );
+    // Separate destructive tools — they run sequentially so the user can confirm each.
+    const safe = toolCalls.filter((tc) => !this.registry.isDestructive(tc.name));
+    const destructive = toolCalls.filter((tc) => this.registry.isDestructive(tc.name));
 
-    // Run safe tools in parallel
     const safeResults = await Promise.all(
       safe.map((tc) => this.executeSingleTool(tc, onEvent, confirmTool, signal))
     );
 
-    // Run destructive tools sequentially (user may need to confirm each)
     const destructiveResults: ChatMessage[] = [];
     for (const tc of destructive) {
-      const msg = await this.executeSingleTool(
-        tc,
-        onEvent,
-        confirmTool,
-        signal
+      destructiveResults.push(
+        await this.executeSingleTool(tc, onEvent, confirmTool, signal)
       );
-      destructiveResults.push(msg);
     }
 
-    // Push all tool results into history in original order
-    const allResults = new Map<string, ChatMessage>();
+    // Re-insert results in the original call order so the model sees them correctly.
+    const byCallId = new Map<string, ChatMessage>();
     for (const msg of [...safeResults, ...destructiveResults]) {
-      if (msg.role === "tool") {
-        allResults.set(msg.tool_call_id, msg);
-      }
+      if (msg.role === "tool") byCallId.set(msg.tool_call_id, msg);
     }
-
     for (const tc of toolCalls) {
-      const msg = allResults.get(tc.id);
+      const msg = byCallId.get(tc.id);
       if (msg) this.history.push(msg);
     }
   }
@@ -353,12 +317,13 @@ export class Agent {
     try {
       input = JSON.parse(tc.argumentsJson || "{}") as Record<string, unknown>;
     } catch {
+      // Malformed JSON from the model — treat as empty input.
       input = {};
     }
 
     onEvent({ type: "tool_call", toolName: tc.name, input, callId: tc.id });
 
-    // Confirmation gate for destructive tools
+    // Ask for confirmation before running destructive tools if the user opted in.
     if (this.config.requireConfirmation && this.registry.isDestructive(tc.name)) {
       const approved = await confirmTool?.(tc.name, input);
       if (!approved) {
@@ -380,12 +345,7 @@ export class Agent {
 
     const result = await this.registry.execute(tc.name, input);
 
-    onEvent({
-      type: "tool_result",
-      toolName: tc.name,
-      result,
-      callId: tc.id,
-    });
+    onEvent({ type: "tool_result", toolName: tc.name, result, callId: tc.id });
 
     if (this.sessionId) {
       await this.persistMessage({
@@ -397,12 +357,7 @@ export class Agent {
       }).catch(() => undefined);
     }
 
-    return {
-      role: "tool",
-      tool_call_id: tc.id,
-      name: tc.name,
-      content: result.content,
-    };
+    return { role: "tool", tool_call_id: tc.id, name: tc.name, content: result.content };
   }
 
   private async persistMessage(msg: {
@@ -421,11 +376,5 @@ export class Agent {
       toolCallId: msg.toolCallId,
       isError: msg.isError,
     });
-  }
-
-  private formatError(err: unknown): string {
-    if (err instanceof Error) return err.message;
-    if (typeof err === "string") return err;
-    return "Unknown error";
   }
 }

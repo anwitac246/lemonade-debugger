@@ -24,7 +24,20 @@ export class ToolRegistry {
           `Rename one of them to avoid conflicts.`
       );
     }
-    this.tools.set(tool.name, tool);
+
+    // Normalize inputSchema at registration time so all downstream serializers
+    // (Groq, Anthropic, etc.) always receive a valid JSON Schema object.
+    // Groq strictly requires { type: "object", properties: {} } at the top level.
+    const normalizedTool: ToolDefinition<unknown> = {
+      ...tool,
+      inputSchema: {
+        type: "object",
+        properties: {},
+        ...tool.inputSchema,
+      },
+    };
+
+    this.tools.set(tool.name, normalizedTool);
     return this;
   }
 

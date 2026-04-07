@@ -1,20 +1,18 @@
 /**
- * DAP tool definitions.
+ * DAP tool definitions — thin adapters between LLM JSON input and DAPSession.
  *
- * Thin adapters between LLM JSON input and DAPSession API.
- * Each factory function receives the session as a closure — no class needed.
+ * Each function is a factory that closes over the shared DAPSession instance.
+ * Schemas are kept intentionally flat so Groq's function-calling API accepts them.
  */
 
 import type { ToolDefinition, ToolResult, DAPStackFrame, DAPVariable } from "../types.js";
 import type { DAPSession } from "../dap/dap-session.js";
 
-type Language = "python" | "node" | "go" | "rust" | "java";
-
 // ─── start_debugger ───────────────────────────────────────────────────────────
 
 interface StartDebuggerInput {
   file: string;
-  language: Language;
+  language: string;
   args?: string[];
   stopOnEntry?: boolean;
 }
@@ -23,9 +21,8 @@ export function makeStartDebuggerTool(session: DAPSession): ToolDefinition<Start
   return {
     name: "start_debugger",
     description:
-      "Launch a debug adapter for the given source file and connect to it. " +
-      "The program pauses at entry by default. Only use when you need LIVE runtime state — " +
-      "prefer read_file and search_code first.",
+      "Launch a debug adapter for the given source file and pause at entry. " +
+      "Only use when you need LIVE runtime state — prefer read_file and search_code first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -35,35 +32,34 @@ export function makeStartDebuggerTool(session: DAPSession): ToolDefinition<Start
         },
         language: {
           type: "string",
+          // Groq accepts enum as a plain array inside the property object.
           enum: ["python", "node", "go", "rust", "java"],
-          description: "Language of the file (determines debug adapter).",
+          description: "Language runtime — determines which debug adapter to launch.",
         },
         args: {
           type: "array",
           items: { type: "string" },
-          description: "Optional command-line arguments to pass to the program.",
+          description: "Optional command-line arguments passed to the program.",
         },
         stopOnEntry: {
           type: "boolean",
-          description: "Whether to pause immediately on start. Default: true.",
+          description: "Pause immediately on program start. Default: true.",
         },
       },
       required: ["file", "language"],
     },
+
     async execute(input): Promise<ToolResult> {
       try {
         const message = await session.start(
           input.file,
-          input.language,
+          input.language as "python" | "node" | "go" | "rust" | "java",
           input.args,
           input.stopOnEntry ?? true
         );
         return { content: message, isError: false };
       } catch (err) {
-        return {
-          content: `Failed to start debugger: ${(err as Error).message}`,
-          isError: true,
-        };
+        return { content: `start_debugger failed: ${(err as Error).message}`, isError: true };
       }
     },
   };
@@ -83,7 +79,7 @@ export function makeSetBreakpointTool(session: DAPSession): ToolDefinition<SetBr
     name: "set_breakpoint",
     description:
       "Set a breakpoint at a specific file and line in the active debug session. " +
-      "Optionally set a condition or log message.",
+      "Optionally provide a condition expression or a log message.",
     inputSchema: {
       type: "object",
       properties: {
@@ -97,31 +93,29 @@ export function makeSetBreakpointTool(session: DAPSession): ToolDefinition<SetBr
         },
         condition: {
           type: "string",
-          description: "Optional condition expression (breaks only when true).",
+          description: "Break only when this expression evaluates to true.",
         },
         logMessage: {
           type: "string",
-          description: "If set, log this message instead of pausing.",
+          description: "Log this message instead of pausing execution.",
         },
       },
       required: ["file", "line"],
     },
+
     async execute(input): Promise<ToolResult> {
       try {
         await session.setBreakpoint(input.file, input.line, {
           condition: input.condition,
           logMessage: input.logMessage,
         });
+        const suffix = input.condition ? ` (condition: ${input.condition})` : "";
         return {
-          content: `Breakpoint set at ${input.file}:${input.line}` +
-            (input.condition ? ` (condition: ${input.condition})` : ""),
+          content: `Breakpoint set at ${input.file}:${input.line}${suffix}`,
           isError: false,
         };
       } catch (err) {
-        return {
-          content: `Failed to set breakpoint: ${(err as Error).message}`,
-          isError: true,
-        };
+        return { content: `set_breakpoint failed: ${(err as Error).message}`, isError: true };
       }
     },
   };
@@ -134,19 +128,23 @@ export function makeGetStackTraceTool(session: DAPSession): ToolDefinition<Recor
     name: "get_stack_trace",
     description:
       "Return the current call stack of the paused program. " +
-      "Each frame includes frameId, function name, source file, and line number. " +
-      "Use frameId with get_variables to inspect locals at that frame.",
+      "Each frame includes its frameId, function name, source file, and line number. " +
+      "Pass frameId to get_variables to inspect locals at that frame.",
     inputSchema: {
       type: "object",
       properties: {},
       required: [],
     },
+
     async execute(): Promise<ToolResult> {
       try {
         const frames: DAPStackFrame[] = await session.getStackTrace();
 
         if (frames.length === 0) {
-          return { content: "No stack frames available — is a debug session running?", isError: false };
+          return {
+            content: "No stack frames — is a debug session active and paused?",
+            isError: false,
+          };
         }
 
         const formatted = frames
@@ -159,10 +157,7 @@ export function makeGetStackTraceTool(session: DAPSession): ToolDefinition<Recor
 
         return { content: `Stack trace (${frames.length} frames):\n${formatted}`, isError: false };
       } catch (err) {
-        return {
-          content: `get_stack_trace failed: ${(err as Error).message}`,
-          isError: true,
-        };
+        return { content: `get_stack_trace failed: ${(err as Error).message}`, isError: true };
       }
     },
   };
@@ -172,7 +167,6 @@ export function makeGetStackTraceTool(session: DAPSession): ToolDefinition<Recor
 
 interface GetVariablesInput {
   frameId: number;
-  /** Optionally filter to a specific variable name */
   filter?: string;
 }
 
@@ -181,30 +175,29 @@ export function makeGetVariablesTool(session: DAPSession): ToolDefinition<GetVar
     name: "get_variables",
     description:
       "List all local variables and their values in the given stack frame. " +
-      "Obtain frameId from get_stack_trace. Optionally filter by variable name.",
+      "Get frameId from get_stack_trace. Optionally filter by variable name substring.",
     inputSchema: {
       type: "object",
       properties: {
         frameId: {
           type: "number",
-          description: "Stack frame ID from get_stack_trace.",
+          description: "Stack frame ID obtained from get_stack_trace.",
         },
         filter: {
           type: "string",
-          description: "Optional variable name substring to filter results.",
+          description: "Optional substring to filter variable names.",
         },
       },
       required: ["frameId"],
     },
+
     async execute(input): Promise<ToolResult> {
       try {
         let vars: DAPVariable[] = await session.getVariables(input.frameId);
 
         if (input.filter) {
-          const filterLower = input.filter.toLowerCase();
-          vars = vars.filter((v) =>
-            v.name.toLowerCase().includes(filterLower)
-          );
+          const lower = input.filter.toLowerCase();
+          vars = vars.filter((v) => v.name.toLowerCase().includes(lower));
         }
 
         if (vars.length === 0) {
@@ -229,10 +222,7 @@ export function makeGetVariablesTool(session: DAPSession): ToolDefinition<GetVar
           isError: false,
         };
       } catch (err) {
-        return {
-          content: `get_variables failed: ${(err as Error).message}`,
-          isError: true,
-        };
+        return { content: `get_variables failed: ${(err as Error).message}`, isError: true };
       }
     },
   };
@@ -241,11 +231,12 @@ export function makeGetVariablesTool(session: DAPSession): ToolDefinition<GetVar
 // ─── continue_execution ───────────────────────────────────────────────────────
 
 interface ContinueExecutionInput {
-  /** Timeout in seconds to wait for next stop. Default 30. */
   timeoutSeconds?: number;
 }
 
-export function makeContinueExecutionTool(session: DAPSession): ToolDefinition<ContinueExecutionInput> {
+export function makeContinueExecutionTool(
+  session: DAPSession
+): ToolDefinition<ContinueExecutionInput> {
   return {
     name: "continue_execution",
     description:
@@ -256,11 +247,12 @@ export function makeContinueExecutionTool(session: DAPSession): ToolDefinition<C
       properties: {
         timeoutSeconds: {
           type: "number",
-          description: "Max seconds to wait for next stop. Default: 30.",
+          description: "Seconds to wait for the next stop event. Default: 30.",
         },
       },
       required: [],
     },
+
     async execute(input): Promise<ToolResult> {
       try {
         const message = await session.continueExecution(
@@ -268,10 +260,7 @@ export function makeContinueExecutionTool(session: DAPSession): ToolDefinition<C
         );
         return { content: message, isError: false };
       } catch (err) {
-        return {
-          content: `continue_execution failed: ${(err as Error).message}`,
-          isError: true,
-        };
+        return { content: `continue_execution failed: ${(err as Error).message}`, isError: true };
       }
     },
   };
