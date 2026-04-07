@@ -46,7 +46,7 @@ export async function createAgent(
 ): Promise<AgentHandle> {
   const config: AgentConfig = {
     apiKey: options.apiKey,
-    model: options.model ?? "llama-3.3-70b-versatile",
+    model: options.model ?? "llama-3.1-8b-instant",
     maxIterations: options.maxIterations ?? 25,
     maxTokens: options.maxTokens ?? 8192,
     temperature: options.temperature ?? 0.2,

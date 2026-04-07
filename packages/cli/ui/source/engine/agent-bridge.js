@@ -55,7 +55,7 @@ async function getHandle() {
 
   handle = await createAgent({
     apiKey,
-    model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
+    model: process.env.GROQ_MODEL ?? "llama-3.1-8b-instant",
     maxIterations: parseInt(process.env.AGENT_MAX_ITERATIONS ?? "25", 10),
     requireConfirmation: process.env.AGENT_REQUIRE_CONFIRM === "true",
     noDb,
@@ -169,6 +169,23 @@ export function getSessionId() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+function getSystemPrompt() {
+	return `You are a senior software engineer debugging an issue.
+Today is ${new Date().toLocaleDateString()}.
+The user's operating system is: ${os.platform()}
+You are running in the directory: ${process.cwd()}
+`;
+}
+
+function getHistory(agent) {
+	const history = agent.getHistory();
+	const recentHistory = history.slice(-10);
+	if (recentHistory.length < history.length) {
+		// TODO: Summarize the older history
+	}
+	return recentHistory;
+}
 
 function formatToolInput(input) {
   if (!input || typeof input !== "object") return String(input);
